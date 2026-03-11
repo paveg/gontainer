@@ -82,7 +82,21 @@ func run() {
 
 	// Set up cgroup resource limits before starting the child.
 	// The child inherits the parent's cgroup, so limits apply automatically.
-	setupCgroup()
+	cgroupPath := setupCgroup()
+
+	// Clean up the cgroup after the container exits.
+	// We must move ourselves out of the cgroup first — a cgroup directory
+	// cannot be removed while any process is still in it (EBUSY).
+	// Then rmdir (os.Remove) removes the directory; the kernel cleans up pseudo-files.
+	defer func() {
+		// Move ourselves back to the init cgroup (created by "make setup-cgroup")
+		if err := os.WriteFile("/sys/fs/cgroup/init/cgroup.procs", []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+			log.Fatal(err)
+		}
+		if err := os.Remove(cgroupPath); err != nil {
+			log.Fatal(err)
+		}
+	}()
 
 	if err := cmd.Run(); err != nil {
 		log.Fatal(err)
@@ -167,9 +181,9 @@ func child() {
 //
 // Prerequisites:
 //
-//	The cgroup subtree_control must have "+memory +pids" enabled.
+//	The cgroup subtree_control must have "+cpu +memory +pids" enabled.
 //	See "make setup-cgroup" for the one-time setup.
-func setupCgroup() {
+func setupCgroup() string {
 	cgroupPath := "/sys/fs/cgroup/gontainer"
 	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
 		log.Fatal(err)
@@ -178,6 +192,15 @@ func setupCgroup() {
 	// Limit container memory to 256MB.
 	// If the container exceeds this, the kernel's OOM killer terminates it.
 	if err := os.WriteFile(cgroupPath+"/memory.max", []byte("268435456"), 0o644); err != nil {
+		log.Fatal(err)
+	}
+
+	// Limit container to 0.5 CPU (equivalent to: docker run --cpus 0.5).
+	// Format: "<quota> <period>" in microseconds.
+	// "50000 100000" means the container can use 50ms out of every 100ms period.
+	// Unlike memory/pids limits which cause hard failures (OOM kill / EAGAIN),
+	// CPU limits throttle the process — it simply runs slower.
+	if err := os.WriteFile(cgroupPath+"/cpu.max", []byte("50000 100000"), 0o644); err != nil {
 		log.Fatal(err)
 	}
 
@@ -194,4 +217,6 @@ func setupCgroup() {
 	if err := os.WriteFile(cgroupPath+"/cgroup.procs", []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
 		log.Fatal(err)
 	}
+
+	return cgroupPath
 }

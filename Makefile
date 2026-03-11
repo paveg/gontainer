@@ -18,4 +18,4 @@ setup-cgroup:
 		for pid in $$(cat /sys/fs/cgroup/cgroup.procs); do \
 			echo $$pid > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null; \
 		done; \
-		echo "+memory +pids" > /sys/fs/cgroup/cgroup.subtree_control'
+		echo "+cpu +memory +pids" > /sys/fs/cgroup/cgroup.subtree_control'

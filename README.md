@@ -33,7 +33,7 @@ sequenceDiagram
     participant child as child()<br/>Isolated Context
 
     User->>run: gontainer run /bin/sh
-    run->>run: setupCgroup()<br/>memory.max = 256MB<br/>pids.max = 20
+    run->>run: setupCgroup()<br/>cpu.max = 0.5 CPU<br/>memory.max = 256MB<br/>pids.max = 20
 
     run->>kernel: clone(CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS)
     kernel->>child: New process with isolated namespaces
@@ -69,6 +69,7 @@ graph TB
     end
 
     subgraph cg ["cgroups v2 — How much can the process use?"]
+        CPU["cpu.max<br/>0.5 CPU limit"]
         MEM["memory.max<br/>256 MB limit"]
         PIDS["pids.max<br/>20 process limit"]
     end
@@ -78,6 +79,7 @@ graph TB
     style MNT fill:#4a9eff,color:#fff
     style CHR fill:#ff9f43,color:#fff
     style PROC fill:#ff9f43,color:#fff
+    style CPU fill:#ee5a24,color:#fff
     style MEM fill:#ee5a24,color:#fff
     style PIDS fill:#ee5a24,color:#fff
 ```
@@ -91,6 +93,7 @@ graph TB
 | Mount isolation | Mount namespace | `CLONE_NEWNS` |
 | Docker image | `chroot` / `pivot_root` | `syscall.Chroot("/rootfs")` |
 | `--memory 256m` | cgroup `memory.max` | `WriteFile("memory.max", "268435456")` |
+| `--cpus 0.5` | cgroup `cpu.max` | `WriteFile("cpu.max", "50000 100000")` |
 | `--pids-limit 20` | cgroup `pids.max` | `WriteFile("pids.max", "20")` |
 
 ## Roadmap
@@ -108,8 +111,8 @@ graph TB
 ### Step 3: Resource Limits (cgroups v2)
 - [x] Memory limit (256MB)
 - [x] PID limit (fork bomb protection)
-- [ ] CPU limit
-- [ ] Cleanup cgroups on container exit
+- [x] CPU limit (0.5 CPU)
+- [x] Cleanup cgroups on container exit
 
 ### Step 4: Image Management
 - [ ] OverlayFS layer support (read-only base + writable upper)

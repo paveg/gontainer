@@ -56,29 +56,41 @@ sequenceDiagram
 ## Linux Kernel Features
 
 ```mermaid
-graph TB
-    subgraph ns ["Namespaces — What can the process see?"]
-        UTS["UTS Namespace<br/>CLONE_NEWUTS<br/>Isolates hostname"]
-        PID["PID Namespace<br/>CLONE_NEWPID<br/>Isolates process tree"]
-        MNT["Mount Namespace<br/>CLONE_NEWNS<br/>Isolates mount points"]
+graph LR
+    subgraph ns [" "]
+        direction TB
+        NS_TITLE["🔵 Namespaces"]
+        UTS["UTS — hostname"]
+        PID["PID — process tree"]
+        MNT["Mount — mount points"]
+        NS_TITLE --- UTS --- PID --- MNT
     end
 
-    subgraph fs ["Filesystem — What files can the process access?"]
-        CHR["chroot<br/>Changes root directory<br/>to Alpine rootfs"]
-        PROC["/proc mount<br/>Fresh procfs for<br/>new PID namespace"]
+    subgraph fs [" "]
+        direction TB
+        FS_TITLE["🟠 Filesystem"]
+        CHR["chroot — root directory"]
+        PROC["/proc — process info"]
+        FS_TITLE --- CHR --- PROC
     end
 
-    subgraph cg ["cgroups v2 — How much can the process use?"]
-        CPU["cpu.max<br/>0.5 CPU limit"]
-        MEM["memory.max<br/>256 MB limit"]
-        PIDS["pids.max<br/>20 process limit"]
+    subgraph cg [" "]
+        direction TB
+        CG_TITLE["🔴 cgroups v2"]
+        CPU["cpu.max — 0.5 CPU"]
+        MEM["memory.max — 256 MB"]
+        PIDS["pids.max — 20 procs"]
+        CG_TITLE --- CPU --- MEM --- PIDS
     end
 
+    style NS_TITLE fill:#4a9eff,color:#fff,font-weight:bold
     style UTS fill:#4a9eff,color:#fff
     style PID fill:#4a9eff,color:#fff
     style MNT fill:#4a9eff,color:#fff
+    style FS_TITLE fill:#ff9f43,color:#fff,font-weight:bold
     style CHR fill:#ff9f43,color:#fff
     style PROC fill:#ff9f43,color:#fff
+    style CG_TITLE fill:#ee5a24,color:#fff,font-weight:bold
     style CPU fill:#ee5a24,color:#fff
     style MEM fill:#ee5a24,color:#fff
     style PIDS fill:#ee5a24,color:#fff

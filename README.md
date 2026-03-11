@@ -55,46 +55,28 @@ sequenceDiagram
 
 ## Linux Kernel Features
 
-```mermaid
-graph LR
-    subgraph ns [" "]
-        direction TB
-        NS_TITLE["🔵 Namespaces"]
-        UTS["UTS — hostname"]
-        PID["PID — process tree"]
-        MNT["Mount — mount points"]
-        NS_TITLE --- UTS --- PID --- MNT
-    end
+### Namespaces — What can the process see?
 
-    subgraph fs [" "]
-        direction TB
-        FS_TITLE["🟠 Filesystem"]
-        CHR["chroot — root directory"]
-        PROC["/proc — process info"]
-        FS_TITLE --- CHR --- PROC
-    end
+| Namespace | Clone Flag | Isolates |
+|---|---|---|
+| UTS | `CLONE_NEWUTS` | Hostname |
+| PID | `CLONE_NEWPID` | Process tree (container sees itself as PID 1) |
+| Mount | `CLONE_NEWNS` | Mount points (`/proc` mount stays inside container) |
 
-    subgraph cg [" "]
-        direction TB
-        CG_TITLE["🔴 cgroups v2"]
-        CPU["cpu.max — 0.5 CPU"]
-        MEM["memory.max — 256 MB"]
-        PIDS["pids.max — 20 procs"]
-        CG_TITLE --- CPU --- MEM --- PIDS
-    end
+### Filesystem — What files can the process access?
 
-    style NS_TITLE fill:#4a9eff,color:#fff,font-weight:bold
-    style UTS fill:#4a9eff,color:#fff
-    style PID fill:#4a9eff,color:#fff
-    style MNT fill:#4a9eff,color:#fff
-    style FS_TITLE fill:#ff9f43,color:#fff,font-weight:bold
-    style CHR fill:#ff9f43,color:#fff
-    style PROC fill:#ff9f43,color:#fff
-    style CG_TITLE fill:#ee5a24,color:#fff,font-weight:bold
-    style CPU fill:#ee5a24,color:#fff
-    style MEM fill:#ee5a24,color:#fff
-    style PIDS fill:#ee5a24,color:#fff
-```
+| Mechanism | Syscall | Effect |
+|---|---|---|
+| chroot | `syscall.Chroot("/rootfs")` | Root directory becomes Alpine rootfs |
+| /proc mount | `syscall.Mount("proc", ...)` | Process info reflects PID namespace |
+
+### cgroups v2 — How much can the process use?
+
+| Resource | File | Limit | Exceeded Behavior |
+|---|---|---|---|
+| CPU | `cpu.max` | 0.5 CPU (50ms/100ms) | Throttled (runs slower) |
+| Memory | `memory.max` | 256 MB | OOM killed |
+| Processes | `pids.max` | 20 | `fork()` returns EAGAIN |
 
 ## Docker Feature Mapping
 

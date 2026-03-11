@@ -47,6 +47,11 @@ func run() {
 func child() {
 	fmt.Printf("Running %v as PID %d\n", os.Args[2:], os.Getpid())
 
+	err := syscall.Sethostname([]byte("gontainer"))
+	if err != nil {
+		os.Exit(1)
+	}
+
 	cmd := exec.Command(os.Args[2], os.Args[3:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout

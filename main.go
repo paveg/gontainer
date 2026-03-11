@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"syscall"
 )
 
@@ -37,9 +38,9 @@ func run() {
 		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
 	}
 
+	initCgroup()
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		handleError(err)
 	}
 }
 
@@ -47,9 +48,25 @@ func run() {
 func child() {
 	fmt.Printf("Running %v as PID %d\n", os.Args[2:], os.Getpid())
 
-	err := syscall.Sethostname([]byte("gontainer"))
-	if err != nil {
-		os.Exit(1)
+	if err := syscall.Sethostname([]byte("gontainer")); err != nil {
+		handleError(err)
+	}
+
+	if err := syscall.Chroot("/rootfs"); err != nil {
+		handleError(err)
+	}
+	if err := syscall.Chdir("/"); err != nil {
+		handleError(err)
+	}
+
+	defer func() {
+		if err := syscall.Unmount("/proc", 0); err != nil {
+			handleError(err)
+		}
+	}()
+
+	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+		handleError(err)
 	}
 
 	cmd := exec.Command(os.Args[2], os.Args[3:]...)
@@ -58,7 +75,29 @@ func child() {
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		handleError(err)
+	}
+}
+
+func handleError(err error) {
+	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	os.Exit(1)
+}
+
+func initCgroup() {
+	cgroupPath := "/sys/fs/cgroup/gontainer"
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+		handleError(err)
+	}
+	// 256 MB memories
+	if err := os.WriteFile(cgroupPath+"/memory.max", []byte("268435456"), 0o644); err != nil {
+		handleError(err)
+	}
+	// Max 20 processes
+	if err := os.WriteFile(cgroupPath+"/pids.max", []byte("20"), 0o644); err != nil {
+		handleError(err)
+	}
+	if err := os.WriteFile(cgroupPath+"/cgroup.procs", []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		handleError(err)
 	}
 }

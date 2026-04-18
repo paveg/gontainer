@@ -77,7 +77,7 @@ func run() {
 		// CLONE_NEWNS: isolate mount points — mounts inside the container
 		//   (like /proc) don't propagate to the host. Without this,
 		//   mounting /proc would overwrite the host's /proc.
-		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWNET,
 	}
 
 	// Set up cgroup resource limits before starting the child.
@@ -124,6 +124,10 @@ func child() {
 		log.Fatal(err)
 	}
 
+	if err := exec.Command("ip", "link", "set", "lo", "up").Run(); err != nil {
+		log.Fatal(err)
+	}
+
 	mergedPath := setupOverlayFS()
 
 	// Change the root filesystem to an Alpine Linux minimal rootfs.
@@ -137,8 +141,12 @@ func child() {
 	if err := syscall.Chroot(mergedPath); err != nil {
 		log.Fatal(err)
 	}
-	os.MkdirAll("/dev", 0o755)
-	syscall.Mknod("/dev/null", syscall.S_IFCHR|0o666, 1*256+3)
+	if err := os.MkdirAll("/dev", 0o755); err != nil {
+		log.Fatal(err)
+	}
+	if err := syscall.Mknod("/dev/null", syscall.S_IFCHR|0o666, 1*256+3); err != nil {
+		log.Fatal(err)
+	}
 	// Must chdir after chroot, otherwise the process retains a reference
 	// to the old root and could escape the chroot via relative paths.
 	if err := syscall.Chdir("/"); err != nil {

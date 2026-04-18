@@ -124,6 +124,8 @@ func child() {
 		log.Fatal(err)
 	}
 
+	mergedPath := setupOverlayFS()
+
 	// Change the root filesystem to an Alpine Linux minimal rootfs.
 	// After chroot, "/" points to /rootfs on the host, so the container
 	// cannot see or access any host files outside of /rootfs.
@@ -132,9 +134,11 @@ func child() {
 	//
 	// Note: Docker uses pivot_root (more secure) instead of chroot,
 	// but chroot demonstrates the same concept more simply.
-	if err := syscall.Chroot("/rootfs"); err != nil {
+	if err := syscall.Chroot(mergedPath); err != nil {
 		log.Fatal(err)
 	}
+	os.MkdirAll("/dev", 0o755)
+	syscall.Mknod("/dev/null", syscall.S_IFCHR|0o666, 1*256+3)
 	// Must chdir after chroot, otherwise the process retains a reference
 	// to the old root and could escape the chroot via relative paths.
 	if err := syscall.Chdir("/"); err != nil {
@@ -219,4 +223,29 @@ func setupCgroup() string {
 	}
 
 	return cgroupPath
+}
+
+func setupOverlayFS() string {
+	if err := os.MkdirAll("/overlay", 0o755); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := syscall.Mount("tmpfs", "/overlay", "tmpfs", 0, ""); err != nil {
+		log.Fatal(err)
+	}
+
+	dirs := []string{"/overlay/upper", "/overlay/work", "/overlay/merged"}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	opts := "lowerdir=/rootfs,upperdir=/overlay/upper,workdir=/overlay/work"
+
+	if err := syscall.Mount("overlay", "/overlay/merged", "overlay", 0, opts); err != nil {
+		log.Fatal(err)
+	}
+
+	return "/overlay/merged"
 }

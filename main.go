@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"strconv"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -98,7 +99,28 @@ func run() {
 		}
 	}()
 
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		log.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+
+	if err := exec.Command("ip", "link", "add", "veth-host", "type", "veth", "peer", "name", "veth-cont").Run(); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := exec.Command("ip", "link", "set", "veth-cont", "netns", strconv.Itoa(pid)).Run(); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := exec.Command("ip", "addr", "add", "10.0.0.1/24", "dev", "veth-host").Run(); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := exec.Command("ip", "link", "set", "veth-host", "up").Run(); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := cmd.Wait(); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -124,7 +146,28 @@ func child() {
 		log.Fatal(err)
 	}
 
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat("/sys/class/net/veth-cont"); err == nil {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			log.Fatal("deadline was exceeded\n")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	if err := exec.Command("ip", "link", "set", "lo", "up").Run(); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := exec.Command("ip", "addr", "add", "10.0.0.2/24", "dev", "veth-cont").Run(); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := exec.Command("ip", "link", "set", "veth-cont", "up").Run(); err != nil {
 		log.Fatal(err)
 	}
 

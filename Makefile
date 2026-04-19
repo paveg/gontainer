@@ -6,7 +6,7 @@ BINARY := /app/gontainer
 build:
 	docker exec $(CONTAINER) go build -o $(BINARY) .
 
-run: build
+run: build setup-cgroup
 	docker exec --privileged -it $(CONTAINER) $(BINARY) run /bin/sh
 
 shell:

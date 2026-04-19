@@ -20,6 +20,13 @@
 //	  │       ├─ chroot into rootfs (filesystem isolation)
 //	  │       ├─ Mount /proc (PID namespace visibility)
 //	  │       └─ exec user command (/bin/sh)
+//
+// TODO: compare this minimal implementation against containerd —
+// specifically how containerd delegates OCI process creation to runc
+// and per-container networking to CNI plugins, instead of driving
+// iproute2/iptables inline the way this runtime does. The contrast
+// clarifies which responsibilities production runtimes factor out,
+// and why (stability, pluggability, multi-tenant networking policy).
 package main
 
 import (

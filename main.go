@@ -161,6 +161,19 @@ func run() {
 //  3. Mounting a fresh /proc for the new PID namespace
 //  4. Executing the user's command
 func child() {
+	// PR_SET_PDEATHSIG: deliver SIGKILL to this process when its parent (run())
+	// dies. Without this, if the parent is killed (or crashes) the child becomes
+	// an orphan that survives until its user command exits on its own — leaking
+	// a namespaced process with a stale network stack. runc uses the same trick
+	// to tie the container's lifecycle to its supervisor.
+	//
+	// Go's stdlib syscall package doesn't wrap prctl(2), so we call it via
+	// RawSyscall6. PR_SET_PDEATHSIG = 1 (see <sys/prctl.h>).
+	const prSetPdeathsig = 1
+	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PRCTL, prSetPdeathsig, uintptr(syscall.SIGKILL), 0, 0, 0, 0); errno != 0 {
+		log.Fatal(errno)
+	}
+
 	// Set the container's hostname. Because we're in a new UTS namespace,
 	// this only affects the container — the host hostname is unchanged.
 	// This is equivalent to: docker run --hostname gontainer

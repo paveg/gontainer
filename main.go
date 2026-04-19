@@ -34,6 +34,13 @@ import (
 	"time"
 )
 
+const (
+	RootSubnet    = "10.0.0.0/24"
+	BridgeIP      = "10.0.0.1/24"
+	BridgeGateway = "10.0.0.1"
+	BridgeName    = "br0"
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		log.Fatalf("Usage: gontainer run <cmd> [args...]\n")
@@ -115,14 +122,18 @@ func run() {
 	}
 
 	defer func() {
-		run_("ip", "link", "del", vethHost)
+		if err := run_("ip", "link", "del", vethHost); err != nil {
+			log.Fatal(err)
+		}
 	}()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		run_("ip", "link", "del", vethHost)
+		if err := run_("ip", "link", "del", vethHost); err != nil {
+			log.Fatal(err)
+		}
 		os.Exit(130)
 	}()
 
@@ -191,6 +202,10 @@ func child() {
 		log.Fatal(err)
 	}
 
+	if err := run_("ip", "route", "add", "default", "via", BridgeGateway); err != nil {
+		log.Fatal(err)
+	}
+
 	mergedPath := setupOverlayFS()
 
 	// Change the root filesystem to an Alpine Linux minimal rootfs.
@@ -204,6 +219,10 @@ func child() {
 	if err := syscall.Chroot(mergedPath); err != nil {
 		log.Fatal(err)
 	}
+	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 8.8.8.8\n"), 0o644); err != nil {
+		log.Fatal(err)
+	}
+
 	if err := os.MkdirAll("/dev", 0o755); err != nil {
 		log.Fatal(err)
 	}
@@ -325,22 +344,18 @@ func setupVethHost(pid int) (string, error) {
 	vethHost := fmt.Sprintf("vethh%d", pid)
 	vethCont := fmt.Sprintf("vethc%d", pid)
 
-	log.Printf("step 1: ip link add %s type veth peer name %s", vethHost, vethCont)
 	if err := run_("ip", "link", "add", vethHost, "type", "veth", "peer", "name", vethCont); err != nil {
 		return "", err
 	}
 
-	log.Printf("step 2: ip link set %s netns %d", vethCont, pid)
 	if err := run_("ip", "link", "set", vethCont, "netns", strconv.Itoa(pid)); err != nil {
 		return "", err
 	}
 
-	log.Printf("step 3: ip link set %s master br0", vethHost)
-	if err := run_("ip", "link", "set", vethHost, "master", "br0"); err != nil {
+	if err := run_("ip", "link", "set", vethHost, "master", BridgeName); err != nil {
 		return "", err
 	}
 
-	log.Printf("step 4: ip link set %s up", vethHost)
 	if err := run_("ip", "link", "set", vethHost, "up"); err != nil {
 		return "", err
 	}
@@ -349,16 +364,24 @@ func setupVethHost(pid int) (string, error) {
 }
 
 func setupBridge() error {
-	if _, err := os.Stat("/sys/class/net/br0"); os.IsNotExist(err) {
-		if err := run_("ip", "link", "add", "br0", "type", "bridge"); err != nil {
+	if _, err := os.Stat("/sys/class/net/" + BridgeName); os.IsNotExist(err) {
+		if err := run_("ip", "link", "add", BridgeName, "type", "bridge"); err != nil {
 			return err
 		}
-
-		if err := run_("ip", "addr", "add", "10.0.0.1/24", "dev", "br0"); err != nil {
+		if err := run_("ip", "addr", "add", BridgeIP, "dev", BridgeName); err != nil {
 			return err
 		}
+		if err := run_("ip", "link", "set", BridgeName, "up"); err != nil {
+			return err
+		}
+	}
 
-		if err := run_("ip", "link", "set", "br0", "up"); err != nil {
+	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0o644); err != nil {
+		return err
+	}
+	check := exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", RootSubnet, "!", "-o", BridgeName, "-j", "MASQUERADE")
+	if err := check.Run(); err != nil {
+		if err := run_("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", RootSubnet, "!", "-o", BridgeName, "-j", "MASQUERADE"); err != nil {
 			return err
 		}
 	}

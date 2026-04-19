@@ -23,10 +23,13 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -102,23 +105,26 @@ func run() {
 	if err := cmd.Start(); err != nil {
 		log.Fatal(err)
 	}
-	pid := cmd.Process.Pid
-
-	if err := exec.Command("ip", "link", "add", "veth-host", "type", "veth", "peer", "name", "veth-cont").Run(); err != nil {
+	if err := setupBridge(); err != nil {
 		log.Fatal(err)
 	}
 
-	if err := exec.Command("ip", "link", "set", "veth-cont", "netns", strconv.Itoa(pid)).Run(); err != nil {
+	vethHost, err := setupVethHost(cmd.Process.Pid)
+	if err != nil {
 		log.Fatal(err)
 	}
 
-	if err := exec.Command("ip", "addr", "add", "10.0.0.1/24", "dev", "veth-host").Run(); err != nil {
-		log.Fatal(err)
-	}
+	defer func() {
+		run_("ip", "link", "del", vethHost)
+	}()
 
-	if err := exec.Command("ip", "link", "set", "veth-host", "up").Run(); err != nil {
-		log.Fatal(err)
-	}
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		run_("ip", "link", "del", vethHost)
+		os.Exit(130)
+	}()
 
 	if err := cmd.Wait(); err != nil {
 		log.Fatal(err)
@@ -137,8 +143,6 @@ func run() {
 //  3. Mounting a fresh /proc for the new PID namespace
 //  4. Executing the user's command
 func child() {
-	log.Printf("Running %v as PID %d\n", os.Args[2:], os.Getpid())
-
 	// Set the container's hostname. Because we're in a new UTS namespace,
 	// this only affects the container — the host hostname is unchanged.
 	// This is equivalent to: docker run --hostname gontainer
@@ -146,28 +150,44 @@ func child() {
 		log.Fatal(err)
 	}
 
+	var vethCont string
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if _, err := os.Stat("/sys/class/net/veth-cont"); err == nil {
+		out, err := exec.Command("ip", "-o", "link", "show").Output()
+		if err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				if idx := strings.Index(line, "vethc"); idx >= 0 {
+					rest := line[idx:]
+					if end := strings.IndexAny(rest, "@: "); end >= 0 {
+						vethCont = rest[:end]
+						break
+					}
+				}
+			}
+		}
+
+		if vethCont != "" {
 			break
 		}
 
 		if time.Now().After(deadline) {
-			log.Fatal("deadline was exceeded\n")
+			log.Fatal("veth not found in netns")
 		}
-
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if err := exec.Command("ip", "link", "set", "lo", "up").Run(); err != nil {
+	pidStr := strings.TrimPrefix(vethCont, "vethc")
+	pid, _ := strconv.Atoi(pidStr)
+	ip := fmt.Sprintf("10.0.0.%d/24", (pid%253)+2)
+
+	if err := run_("ip", "link", "set", "lo", "up"); err != nil {
+		log.Fatal(err)
+	}
+	if err := run_("ip", "addr", "add", ip, "dev", vethCont); err != nil {
 		log.Fatal(err)
 	}
 
-	if err := exec.Command("ip", "addr", "add", "10.0.0.2/24", "dev", "veth-cont").Run(); err != nil {
-		log.Fatal(err)
-	}
-
-	if err := exec.Command("ip", "link", "set", "veth-cont", "up").Run(); err != nil {
+	if err := run_("ip", "link", "set", vethCont, "up"); err != nil {
 		log.Fatal(err)
 	}
 
@@ -239,7 +259,7 @@ func child() {
 //	The cgroup subtree_control must have "+cpu +memory +pids" enabled.
 //	See "make setup-cgroup" for the one-time setup.
 func setupCgroup() string {
-	cgroupPath := "/sys/fs/cgroup/gontainer"
+	cgroupPath := fmt.Sprintf("/sys/fs/cgroup/gontainer-%d", os.Getpid())
 	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
 		log.Fatal(err)
 	}
@@ -299,4 +319,55 @@ func setupOverlayFS() string {
 	}
 
 	return "/overlay/merged"
+}
+
+func setupVethHost(pid int) (string, error) {
+	vethHost := fmt.Sprintf("vethh%d", pid)
+	vethCont := fmt.Sprintf("vethc%d", pid)
+
+	log.Printf("step 1: ip link add %s type veth peer name %s", vethHost, vethCont)
+	if err := run_("ip", "link", "add", vethHost, "type", "veth", "peer", "name", vethCont); err != nil {
+		return "", err
+	}
+
+	log.Printf("step 2: ip link set %s netns %d", vethCont, pid)
+	if err := run_("ip", "link", "set", vethCont, "netns", strconv.Itoa(pid)); err != nil {
+		return "", err
+	}
+
+	log.Printf("step 3: ip link set %s master br0", vethHost)
+	if err := run_("ip", "link", "set", vethHost, "master", "br0"); err != nil {
+		return "", err
+	}
+
+	log.Printf("step 4: ip link set %s up", vethHost)
+	if err := run_("ip", "link", "set", vethHost, "up"); err != nil {
+		return "", err
+	}
+
+	return vethHost, nil
+}
+
+func setupBridge() error {
+	if _, err := os.Stat("/sys/class/net/br0"); os.IsNotExist(err) {
+		if err := run_("ip", "link", "add", "br0", "type", "bridge"); err != nil {
+			return err
+		}
+
+		if err := run_("ip", "addr", "add", "10.0.0.1/24", "dev", "br0"); err != nil {
+			return err
+		}
+
+		if err := run_("ip", "link", "set", "br0", "up"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func run_(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }

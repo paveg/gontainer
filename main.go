@@ -379,8 +379,7 @@ func setupBridge() error {
 	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0o644); err != nil {
 		return err
 	}
-	check := exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", RootSubnet, "!", "-o", BridgeName, "-j", "MASQUERADE")
-	if err := check.Run(); err != nil {
+	if err := run_("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", RootSubnet, "!", "-o", BridgeName, "-j", "MASQUERADE"); err != nil {
 		if err := run_("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", RootSubnet, "!", "-o", BridgeName, "-j", "MASQUERADE"); err != nil {
 			return err
 		}

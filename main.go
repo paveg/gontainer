@@ -20,14 +20,32 @@
 //	  │       ├─ chroot into rootfs (filesystem isolation)
 //	  │       ├─ Mount /proc (PID namespace visibility)
 //	  │       └─ exec user command (/bin/sh)
+//
+// TODO: compare this minimal implementation against containerd —
+// specifically how containerd delegates OCI process creation to runc
+// and per-container networking to CNI plugins, instead of driving
+// iproute2/iptables inline the way this runtime does. The contrast
+// clarifies which responsibilities production runtimes factor out,
+// and why (stability, pluggability, multi-tenant networking policy).
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
+	"time"
+)
+
+const (
+	RootSubnet    = "10.0.0.0/24"
+	BridgeIP      = "10.0.0.1/24"
+	BridgeGateway = "10.0.0.1"
+	BridgeName    = "br0"
 )
 
 func main() {
@@ -77,7 +95,7 @@ func run() {
 		// CLONE_NEWNS: isolate mount points — mounts inside the container
 		//   (like /proc) don't propagate to the host. Without this,
 		//   mounting /proc would overwrite the host's /proc.
-		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
+		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWNET,
 	}
 
 	// Set up cgroup resource limits before starting the child.
@@ -98,7 +116,35 @@ func run() {
 		}
 	}()
 
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		log.Fatal(err)
+	}
+	if err := setupBridge(); err != nil {
+		log.Fatal(err)
+	}
+
+	vethHost, err := setupVethHost(cmd.Process.Pid)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer func() {
+		if err := run_("ip", "link", "del", vethHost); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		if err := run_("ip", "link", "del", vethHost); err != nil {
+			log.Fatal(err)
+		}
+		os.Exit(130)
+	}()
+
+	if err := cmd.Wait(); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -115,12 +161,68 @@ func run() {
 //  3. Mounting a fresh /proc for the new PID namespace
 //  4. Executing the user's command
 func child() {
-	log.Printf("Running %v as PID %d\n", os.Args[2:], os.Getpid())
+	// PR_SET_PDEATHSIG: deliver SIGKILL to this process when its parent (run())
+	// dies. Without this, if the parent is killed (or crashes) the child becomes
+	// an orphan that survives until its user command exits on its own — leaking
+	// a namespaced process with a stale network stack. runc uses the same trick
+	// to tie the container's lifecycle to its supervisor.
+	//
+	// Go's stdlib syscall package doesn't wrap prctl(2), so we call it via
+	// RawSyscall6. PR_SET_PDEATHSIG = 1 (see <sys/prctl.h>).
+	const prSetPdeathsig = 1
+	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PRCTL, prSetPdeathsig, uintptr(syscall.SIGKILL), 0, 0, 0, 0); errno != 0 {
+		log.Fatal(errno)
+	}
 
 	// Set the container's hostname. Because we're in a new UTS namespace,
 	// this only affects the container — the host hostname is unchanged.
 	// This is equivalent to: docker run --hostname gontainer
 	if err := syscall.Sethostname([]byte("gontainer")); err != nil {
+		log.Fatal(err)
+	}
+
+	var vethCont string
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		out, err := exec.Command("ip", "-o", "link", "show").Output()
+		if err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				if idx := strings.Index(line, "vethc"); idx >= 0 {
+					rest := line[idx:]
+					if end := strings.IndexAny(rest, "@: "); end >= 0 {
+						vethCont = rest[:end]
+						break
+					}
+				}
+			}
+		}
+
+		if vethCont != "" {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			log.Fatal("veth not found in netns")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	pidStr := strings.TrimPrefix(vethCont, "vethc")
+	pid, _ := strconv.Atoi(pidStr)
+	ip := fmt.Sprintf("10.0.0.%d/24", (pid%253)+2)
+
+	if err := run_("ip", "link", "set", "lo", "up"); err != nil {
+		log.Fatal(err)
+	}
+	if err := run_("ip", "addr", "add", ip, "dev", vethCont); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := run_("ip", "link", "set", vethCont, "up"); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := run_("ip", "route", "add", "default", "via", BridgeGateway); err != nil {
 		log.Fatal(err)
 	}
 
@@ -137,8 +239,16 @@ func child() {
 	if err := syscall.Chroot(mergedPath); err != nil {
 		log.Fatal(err)
 	}
-	os.MkdirAll("/dev", 0o755)
-	syscall.Mknod("/dev/null", syscall.S_IFCHR|0o666, 1*256+3)
+	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 8.8.8.8\n"), 0o644); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := os.MkdirAll("/dev", 0o755); err != nil {
+		log.Fatal(err)
+	}
+	if err := syscall.Mknod("/dev/null", syscall.S_IFCHR|0o666, 1*256+3); err != nil {
+		log.Fatal(err)
+	}
 	// Must chdir after chroot, otherwise the process retains a reference
 	// to the old root and could escape the chroot via relative paths.
 	if err := syscall.Chdir("/"); err != nil {
@@ -188,7 +298,7 @@ func child() {
 //	The cgroup subtree_control must have "+cpu +memory +pids" enabled.
 //	See "make setup-cgroup" for the one-time setup.
 func setupCgroup() string {
-	cgroupPath := "/sys/fs/cgroup/gontainer"
+	cgroupPath := fmt.Sprintf("/sys/fs/cgroup/gontainer-%d", os.Getpid())
 	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
 		log.Fatal(err)
 	}
@@ -248,4 +358,58 @@ func setupOverlayFS() string {
 	}
 
 	return "/overlay/merged"
+}
+
+func setupVethHost(pid int) (string, error) {
+	vethHost := fmt.Sprintf("vethh%d", pid)
+	vethCont := fmt.Sprintf("vethc%d", pid)
+
+	if err := run_("ip", "link", "add", vethHost, "type", "veth", "peer", "name", vethCont); err != nil {
+		return "", err
+	}
+
+	if err := run_("ip", "link", "set", vethCont, "netns", strconv.Itoa(pid)); err != nil {
+		return "", err
+	}
+
+	if err := run_("ip", "link", "set", vethHost, "master", BridgeName); err != nil {
+		return "", err
+	}
+
+	if err := run_("ip", "link", "set", vethHost, "up"); err != nil {
+		return "", err
+	}
+
+	return vethHost, nil
+}
+
+func setupBridge() error {
+	if _, err := os.Stat("/sys/class/net/" + BridgeName); os.IsNotExist(err) {
+		if err := run_("ip", "link", "add", BridgeName, "type", "bridge"); err != nil {
+			return err
+		}
+		if err := run_("ip", "addr", "add", BridgeIP, "dev", BridgeName); err != nil {
+			return err
+		}
+		if err := run_("ip", "link", "set", BridgeName, "up"); err != nil {
+			return err
+		}
+	}
+
+	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0o644); err != nil {
+		return err
+	}
+	if err := run_("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", RootSubnet, "!", "-o", BridgeName, "-j", "MASQUERADE"); err != nil {
+		if err := run_("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", RootSubnet, "!", "-o", BridgeName, "-j", "MASQUERADE"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func run_(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }

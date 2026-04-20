@@ -21,12 +21,22 @@
 //	  │       ├─ Mount /proc (PID namespace visibility)
 //	  │       └─ exec user command (/bin/sh)
 //
-// TODO: compare this minimal implementation against containerd —
-// specifically how containerd delegates OCI process creation to runc
-// and per-container networking to CNI plugins, instead of driving
-// iproute2/iptables inline the way this runtime does. The contrast
-// clarifies which responsibilities production runtimes factor out,
-// and why (stability, pluggability, multi-tenant networking policy).
+// Advanced (intentionally out of scope for this runtime):
+//
+//   - runc          — OCI runtime-spec compliance, pivot_root instead
+//                     of chroot, and seccomp profile setup per container.
+//   - CNI plugins   — pluggable per-container networking. This is what
+//                     containerd delegates to instead of calling
+//                     iproute2/iptables inline the way run() does here.
+//   - OCI image store + shim — image layer management, and a shim
+//                     process per container so the supervisor can be
+//                     upgraded without killing running containers.
+//   - Rootless      — user namespaces mapping container UIDs to
+//                     unprivileged host UIDs, removing the
+//                     `docker run --privileged` requirement.
+//
+// gontainer covers the kernel-boundary primitives these layers sit on
+// top of; each bullet is a separate rabbit hole if/when you want it.
 package main
 
 import (

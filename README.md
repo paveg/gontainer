@@ -35,16 +35,25 @@ sequenceDiagram
     User->>run: gontainer run /bin/sh
     run->>run: setupCgroup()<br/>cpu.max = 0.5 CPU<br/>memory.max = 256MB<br/>pids.max = 20
 
-    run->>kernel: clone(CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS)
+    run->>kernel: clone(CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET)
     kernel->>child: New process with isolated namespaces
 
     Note over child: PID = 1 (new PID namespace)
 
+    run->>run: setupBridge() + setupVethHost(pid)
+    Note over run: veth pair, br0 plumbing,<br/>iptables MASQUERADE<br/>(see "Networking" section)
+
+    child->>kernel: prctl(PR_SET_PDEATHSIG, SIGKILL)
+    Note over child: orphan-safe —<br/>kernel kills child if parent dies
+
     child->>kernel: sethostname("gontainer")
     Note over child: Hostname isolated
 
+    child->>child: ip addr add + ip route add default via 10.0.0.1
+    Note over child: Container gets its IP<br/>+ default gateway
+
     child->>kernel: chroot("/rootfs") + chdir("/")
-    Note over child: Filesystem isolated (Alpine rootfs)
+    Note over child: Filesystem isolated (OverlayFS on Alpine rootfs)
 
     child->>kernel: mount("proc", "/proc", "proc")
     Note over child: /proc shows only container processes
@@ -62,6 +71,7 @@ sequenceDiagram
 | UTS | `CLONE_NEWUTS` | Hostname |
 | PID | `CLONE_NEWPID` | Process tree (container sees itself as PID 1) |
 | Mount | `CLONE_NEWNS` | Mount points (`/proc` mount stays inside container) |
+| Network | `CLONE_NEWNET` | Network stack — interfaces, routes, `iptables`, sockets, `/proc/net` |
 
 ### Filesystem — What files can the process access?
 
@@ -69,6 +79,7 @@ sequenceDiagram
 |---|---|---|
 | chroot | `syscall.Chroot("/rootfs")` | Root directory becomes Alpine rootfs |
 | /proc mount | `syscall.Mount("proc", ...)` | Process info reflects PID namespace |
+| OverlayFS | `syscall.Mount("overlay", ..., "lowerdir=/rootfs,upperdir=…,workdir=…")` | Copy-on-write — container writes land in a tmpfs upper layer, rootfs stays read-only |
 
 ### cgroups v2 — How much can the process use?
 
@@ -78,6 +89,48 @@ sequenceDiagram
 | Memory | `memory.max` | 256 MB | OOM killed |
 | Processes | `pids.max` | 20 | `fork()` returns EAGAIN |
 
+### Networking — Who can the process talk to?
+
+Each container gets its own network namespace. To give it reachability, `run()` plumbs a **veth pair** between the host and the container, attaches the host end to a shared **Linux bridge** (`br0`, `10.0.0.1/24`), and installs an **iptables MASQUERADE** rule so traffic leaving the bridge appears to come from the host's outbound interface.
+
+```mermaid
+graph TB
+    subgraph host["Host"]
+        eth["eth0<br/>(external)"]
+        br["br0<br/>10.0.0.1/24"]
+        ipt["iptables POSTROUTING<br/>-s 10.0.0.0/24 ! -o br0 -j MASQUERADE"]
+        sysctl["net.ipv4.ip_forward = 1"]
+    end
+
+    subgraph cA["Container A (netns A)"]
+        lA["lo 127.0.0.1"]
+        vA["vethc&lt;pidA&gt;<br/>10.0.0.X/24<br/>default via 10.0.0.1"]
+    end
+
+    subgraph cB["Container B (netns B)"]
+        lB["lo 127.0.0.1"]
+        vB["vethc&lt;pidB&gt;<br/>10.0.0.Y/24<br/>default via 10.0.0.1"]
+    end
+
+    br -->|vethh&lt;pidA&gt;| vA
+    br -->|vethh&lt;pidB&gt;| vB
+    br --> ipt --> eth
+    sysctl -.enables.-> ipt
+    eth --> internet((Internet))
+```
+
+| Piece | Command / File | Role |
+|---|---|---|
+| Bridge | `ip link add br0 type bridge` + `ip addr add 10.0.0.1/24 dev br0` | Central L2 hub + default gateway for all containers |
+| veth pair | `ip link add vethh<pid> type veth peer name vethc<pid>` | Host ↔ container virtual cable |
+| Move into ns | `ip link set vethc<pid> netns <pid>` | Push container end into the child's netns by PID |
+| IP allocation | `(pid % 253) + 2` in the container | PID-derived IP to avoid collisions between concurrent containers |
+| IP forwarding | `echo 1 > /proc/sys/net/ipv4/ip_forward` | Lets the kernel route packets between `br0` and the external interface |
+| SNAT | `iptables -t nat -A POSTROUTING -s 10.0.0.0/24 ! -o br0 -j MASQUERADE` | Rewrites the source IP when packets leave the host, so the internet can reply |
+| DNS | `echo "nameserver 8.8.8.8" > /etc/resolv.conf` (post-chroot) | Makes hostname lookups work inside the container |
+| Lifecycle | `prctl(PR_SET_PDEATHSIG, SIGKILL)` in the child | If the parent dies unexpectedly, the kernel kills the child too — avoids orphan containers with stale netns |
+| Cleanup | `defer ip link del vethh<pid>` + SIGINT/SIGTERM handler | Host-side veth is removed on any normal exit path |
+
 ## Docker Feature Mapping
 
 | Docker CLI | Linux Kernel | gontainer |
@@ -86,6 +139,8 @@ sequenceDiagram
 | Process isolation | PID namespace + procfs | `CLONE_NEWPID` + `mount("proc")` |
 | Mount isolation | Mount namespace | `CLONE_NEWNS` |
 | Docker image | `chroot` / `pivot_root` | `syscall.Chroot("/rootfs")` |
+| Copy-on-write layers | OverlayFS | `syscall.Mount("overlay", …, "lowerdir=/rootfs,upperdir=…,workdir=…")` |
+| `--network bridge` (default) | netns + veth + bridge + `iptables` MASQUERADE | `CLONE_NEWNET` + `setupBridge()` + `setupVethHost()` |
 | `--memory 256m` | cgroup `memory.max` | `WriteFile("memory.max", "268435456")` |
 | `--cpus 0.5` | cgroup `cpu.max` | `WriteFile("cpu.max", "50000 100000")` |
 | `--pids-limit 20` | cgroup `pids.max` | `WriteFile("pids.max", "20")` |
@@ -109,25 +164,32 @@ sequenceDiagram
 - [x] Cleanup cgroups on container exit
 
 ### Step 4: Image Management
-- [ ] OverlayFS layer support (read-only base + writable upper)
+- [x] OverlayFS layer support (read-only base + writable upper)
 - [ ] Simple `pull` command to fetch Alpine minirootfs
 
 ### Step 5: Networking
-- [ ] Network namespace (`CLONE_NEWNET`)
-- [ ] Create veth pair
-- [ ] Set up bridge interface
-- [ ] NAT for outbound traffic
+- [x] Network namespace (`CLONE_NEWNET`)
+- [x] Create veth pair (`vethh<pid>` / `vethc<pid>`)
+- [x] Set up bridge interface (`br0`, 10.0.0.1/24)
+- [x] NAT for outbound traffic (`iptables MASQUERADE` + `ip_forward`)
 
-### What gontainer Does NOT Implement
+### Step 6: Lifecycle hardening
+- [x] Host-side veth cleanup on normal exit + SIGINT/SIGTERM
+- [x] `PR_SET_PDEATHSIG` so an orphaned child is killed by the kernel — this also lets the kernel auto-remove both ends of the veth pair when the child's netns is torn down, so even `kill -9` on the parent leaves no lingering `vethh<pid>` interfaces
 
-| Feature | What it does |
+### Advanced — intentionally out of scope
+
+gontainer deliberately stops at the kernel-boundary primitives. Each row below is a separate rabbit hole that production runtimes (runc, containerd, Docker, Podman) layer on top of this baseline. Listed here as signposts, not as a TODO.
+
+| Topic | What it adds |
 |---|---|
-| **Network namespace** | Isolates network stack (own IP, ports, routing) |
-| **User namespace** | Maps UID/GID (root inside, unprivileged outside) |
-| **pivot_root** | More secure alternative to chroot |
-| **OverlayFS** | Copy-on-write image layers |
-| **seccomp** | Syscall filtering |
-| **AppArmor / SELinux** | Mandatory access control |
+| **User namespace** | Maps UID/GID (root inside, unprivileged outside) — the core mechanism behind rootless containers |
+| **pivot_root** | The more secure root switch runc uses (prevents escape via an open fd on the old root) |
+| **seccomp** | Per-container syscall allowlist / denylist |
+| **AppArmor / SELinux** | Mandatory access control profiles |
+| **OCI image pull / registry** | Fetching and unpacking image layers from a registry — currently Alpine rootfs must be pre-extracted |
+| **CNI-style pluggable networking** | The delegation boundary containerd sits on. Replaces the inline `iproute2` / `iptables` calls in this runtime with out-of-process plugins |
+| **OCI runtime-spec + shim** | `config.json` compliance and a per-container supervisor process that decouples container lifetime from the daemon's |
 
 ## Prerequisites
 
@@ -165,8 +227,13 @@ Inside gontainer:
 hostname              # → gontainer (isolated)
 ps aux                # → only container processes
 ls /                  # → Alpine rootfs (not host)
-cat /proc/self/cgroup # → /gontainer (cgroup applied)
+cat /proc/self/cgroup # → /gontainer-<pid> (cgroup applied)
+ip addr               # → only lo + vethc<pid>, no host NICs
+ping -c1 10.0.0.1     # → bridge (host side) reachable
+ping -c1 8.8.8.8      # → internet reachable via MASQUERADE
 ```
+
+Start a second `make run` in another shell and the two containers can ping each other directly through `br0`.
 
 ## References
 
